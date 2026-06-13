@@ -623,8 +623,7 @@ function LoginScreen({ onDone }) {
       </button>
 
       <p className="mt-6 text-[11px] text-center leading-relaxed px-4" style={{ color: "#BCC0B8" }}>
-        IDとパスワードは個人を特定する情報ではありません。{"
-"}同じ組み合わせで複数端末から同じデータにアクセスできます。
+        IDとパスワードは個人を特定する情報ではありません。同じ組み合わせで複数端末から同じデータにアクセスできます。
       </p>
     </div>
   );
@@ -807,7 +806,7 @@ function RecordForm() {
           <div>
             <label className="block text-xs font-bold mb-1.5" style={{ color: "#9C9488" }}>メモ内容</label>
             <textarea value={memo} onChange={e => setMemo(e.target.value)}
-              placeholder={"業務内容・申し送り事項など\n（Enterで改行できます）"}
+              placeholder="業務内容・申し送り事項など"
               rows={4}
               className="ck-input w-full px-4 py-3 text-base resize-none leading-relaxed" />
           </div>
