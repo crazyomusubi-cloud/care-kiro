@@ -329,6 +329,11 @@ function GlobalStyle() {
       @media (prefers-reduced-motion: reduce) {
         * { animation: none !important; transition: none !important; }
       }
+      /* ピンチズーム無効化 */
+      html, body {
+        touch-action: pan-x pan-y;
+        -ms-touch-action: pan-x pan-y;
+      }
     `}</style>
   );
 }
@@ -1949,8 +1954,9 @@ function RelayMemoView() {
           </div>
         </div>
       )}
-      {/* 人物タブ（横スクロール） */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1" style={{ WebkitOverflowScrolling: "touch" }}>
+      {/* 人物タブ（横スクロール）＋追加ボタンを右固定 */}
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 overflow-x-auto flex-1 pb-1" style={{ WebkitOverflowScrolling: "touch" }}>
         {memo.persons.map((p) => {
           const on = p.id === activePersonId;
           const cnt = memo.items.filter(it => it.personId === p.id && !it.done).length;
@@ -1970,22 +1976,24 @@ function RelayMemoView() {
             </button>
           );
         })}
-        {/* 人物追加ボタン */}
-        <button onClick={() => setAddingPerson(true)}
-          className="flex items-center justify-center w-9 h-9 rounded-full flex-shrink-0 transition-all active:scale-95"
-          style={{ background: "#F3EFE7", color: "#A08C68", border: "1px dashed #D9C193" }}
-          title="人物を追加">
-          <UserPlus size={16} />
-        </button>
-        {/* 並べ替えボタン */}
-        {memo.persons.length > 1 && (
-          <button onClick={() => setShowReorderModal(true)}
-            className="flex items-center justify-center w-9 h-9 rounded-full flex-shrink-0 transition-all active:scale-95"
-            style={{ background: "#F3EFE7", color: "#A08C68", border: "1px solid #E0D7C5" }}
-            title="並べ替え">
-            <ArrowUp size={16} />
+        </div>
+        {/* 人物追加ボタン（右固定）*/}
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          <button onClick={() => setAddingPerson(true)}
+            className="flex items-center justify-center w-9 h-9 rounded-full transition-all active:scale-95"
+            style={{ background: "#F3EFE7", color: "#A08C68", border: "1px dashed #D9C193" }}
+            title="人物を追加">
+            <UserPlus size={16} />
           </button>
-        )}
+          {memo.persons.length > 1 && (
+            <button onClick={() => setShowReorderModal(true)}
+              className="flex items-center justify-center w-9 h-9 rounded-full transition-all active:scale-95"
+              style={{ background: "#F3EFE7", color: "#A08C68", border: "1px solid #E0D7C5" }}
+              title="並べ替え">
+              <ArrowUp size={16} />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* 人物追加インライン入力 */}
