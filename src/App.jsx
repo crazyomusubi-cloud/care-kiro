@@ -7,7 +7,8 @@ import {
   Copy, Check, X, ChevronLeft, Pencil, ArrowUp, ArrowDown,
   UploadCloud, DownloadCloud, KeyRound, Eye, EyeOff, Cloud, CloudOff, ShieldCheck,
   Pin,
-  LogIn, LogOut, Wifi, WifiOff, RefreshCw, UserCircle2
+  LogIn, LogOut, Wifi, WifiOff, RefreshCw, UserCircle2,
+  MessageSquare
 } from "lucide-react";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -88,11 +89,11 @@ function syncDocUrl(docId) {
 }
 
 // クラウドへ全データを保存（自動同期）
-async function cloudSave(docId, logs, settings) {
+async function cloudSave(docId, logs, settings, memo) {
   const payload = JSON.stringify({
     app: "carekiro", version: 1,
     savedAt: new Date().toISOString(),
-    logs, settings,
+    logs, settings, memo,
   });
   const res = await fetch(syncDocUrl(docId), {
     method: "PATCH",
@@ -151,6 +152,7 @@ function defaultChecks() {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const STORAGE_KEY = "care_logs_v1";
 const SETTINGS_KEY = "care_settings_v1";
+const MEMO_KEY = "care_relay_v1";        // 伝達メモ { persons:[{id,name}], items:[{id,personId,name,memo,done,doneAt,createdAt}] }
 const RETENTION_DAYS = 30;
 
 const FONT_BODY = "'Noto Sans JP', -apple-system, BlinkMacSystemFont, 'Hiragino Sans', sans-serif";
@@ -189,6 +191,36 @@ function loadSettings() {
     if (!raw) return { notificationEnabled: false, notificationTime: "17:00" };
     return JSON.parse(raw);
   } catch { return { notificationEnabled: false, notificationTime: "17:00" }; }
+}
+
+// 伝達メモ: 30日経過した項目を削除
+function purgeOldMemo(memo) {
+  if (!memo || !memo.items) return { persons: memo?.persons ?? [], items: [] };
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - RETENTION_DAYS);
+  const cutoffMs = cutoff.getTime();
+  const items = memo.items.filter(it => {
+    const created = new Date(it.createdAt).getTime();
+    return created >= cutoffMs;
+  });
+  return { persons: memo.persons ?? [], items };
+}
+
+function loadMemo() {
+  try {
+    const raw = localStorage.getItem(MEMO_KEY);
+    if (!raw) return { persons: [], items: [] };
+    return purgeOldMemo(JSON.parse(raw));
+  } catch { return { persons: [], items: [] }; }
+}
+
+// 削除期限が近い（残り3日以内）未伝達項目があるか
+function hasExpiringMemo(memo) {
+  if (!memo || !memo.items) return false;
+  const warn = new Date();
+  warn.setDate(warn.getDate() - (RETENTION_DAYS - 3));
+  const warnMs = warn.getTime();
+  return memo.items.some(it => !it.done && new Date(it.createdAt).getTime() < warnMs);
 }
 
 function formatOutput(records) {
@@ -313,6 +345,7 @@ function AppProvider({ children }) {
     d.setDate(d.getDate() - 1);
     return d.toISOString().slice(0, 10);
   });
+  const [memo, setMemo] = useState(loadMemo);   // 伝達メモ { persons, items }
 
   // ── 認証・同期状態 ──
   const [auth, setAuth] = useState(loadAuth);   // { userId, docId } | null
@@ -331,12 +364,16 @@ function AppProvider({ children }) {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   }, [settings]);
 
+  useEffect(() => {
+    localStorage.setItem(MEMO_KEY, JSON.stringify(memo));
+  }, [memo]);
+
   // ── クラウド同期（ログイン中のみ）: データ変更後300msデバウンス ──
-  const syncToCloud = useCallback(async (logs, cfg) => {
+  const syncToCloud = useCallback(async (logs, cfg, memoData) => {
     if (!isCloudConfigured() || !auth) return;
     setSyncStatus("syncing");
     try {
-      await cloudSave(auth.docId, logs, cfg);
+      await cloudSave(auth.docId, logs, cfg, memoData);
       setSyncStatus("ok");
     } catch {
       setSyncStatus("error");
@@ -347,10 +384,10 @@ function AppProvider({ children }) {
     if (!auth) return;
     clearTimeout(syncTimerRef.current);
     syncTimerRef.current = setTimeout(() => {
-      syncToCloud(allLogs, settings);
+      syncToCloud(allLogs, settings, memo);
     }, 300);
     return () => clearTimeout(syncTimerRef.current);
-  }, [allLogs, settings, auth, syncToCloud]);
+  }, [allLogs, settings, memo, auth, syncToCloud]);
 
   // ── 起動時にクラウドから最新データを取得（ログイン中のみ） ──
   useEffect(() => {
@@ -360,6 +397,7 @@ function AppProvider({ children }) {
       if (!data) { setSyncStatus("ok"); return; }
       setAllLogs(purgeOld(data.logs ?? {}));
       if (data.settings) setSettings(data.settings);
+      if (data.memo) setMemo(purgeOldMemo(data.memo));
       setSyncStatus("ok");
     }).catch(() => setSyncStatus("error"));
   }, [auth]);
@@ -474,9 +512,115 @@ function AppProvider({ children }) {
   }, []);
 
   // クラウド復元時：取得したデータでローカルを丸ごと置き換える
-  const restoreData = useCallback((logs, restoredSettings) => {
+  const restoreData = useCallback((logs, restoredSettings, restoredMemo) => {
     setAllLogs(purgeOld(logs ?? {}));
     if (restoredSettings) setSettings(restoredSettings);
+    if (restoredMemo) setMemo(purgeOldMemo(restoredMemo));
+  }, []);
+
+  // ── 伝達メモ: 人物の追加 ──
+  const addMemoPerson = useCallback((name) => {
+    const trimmed = (name ?? "").trim();
+    if (!trimmed) return null;
+    const id = crypto.randomUUID();
+    setMemo(prev => ({ ...prev, persons: [...prev.persons, { id, name: trimmed }] }));
+    return id;
+  }, []);
+
+  // ── 伝達メモ: 人物の削除（その人の項目も削除）──
+  const deleteMemoPerson = useCallback((personId) => {
+    setMemo(prev => ({
+      persons: prev.persons.filter(p => p.id !== personId),
+      items: prev.items.filter(it => it.personId !== personId),
+    }));
+  }, []);
+
+  // ── 伝達メモ: 人物の並べ替え ──
+  const reorderMemoPerson = useCallback((personId, direction) => {
+    setMemo(prev => {
+      const persons = [...prev.persons];
+      const idx = persons.findIndex(p => p.id === personId);
+      if (idx === -1) return prev;
+      if (direction === "up" && idx === 0) return prev;
+      if (direction === "down" && idx === persons.length - 1) return prev;
+      const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+      [persons[idx], persons[swapIdx]] = [persons[swapIdx], persons[idx]];
+      return { ...prev, persons };
+    });
+  }, []);
+
+  // ── 伝達メモ: 項目の追加 ──
+  const addMemoItem = useCallback((personId, name, body) => {
+    const item = {
+      id: crypto.randomUUID(),
+      personId,
+      name: (name ?? "").trim(),
+      memo: (body ?? "").trim(),
+      done: false,
+      doneAt: null,
+      createdAt: new Date().toISOString(),
+    };
+    setMemo(prev => ({ ...prev, items: [...prev.items, item] }));
+  }, []);
+
+  // ── 伝達メモ: 項目の編集 ──
+  const updateMemoItem = useCallback((itemId, updates) => {
+    setMemo(prev => ({
+      ...prev,
+      items: prev.items.map(it => it.id === itemId ? { ...it, ...updates } : it),
+    }));
+  }, []);
+
+  // ── 伝達メモ: 項目の削除 ──
+  const deleteMemoItem = useCallback((itemId) => {
+    setMemo(prev => ({ ...prev, items: prev.items.filter(it => it.id !== itemId) }));
+  }, []);
+
+  // ── 伝達メモ: 伝達済みトグル ──
+  const toggleMemoDone = useCallback((itemId, done) => {
+    setMemo(prev => ({
+      ...prev,
+      items: prev.items.map(it =>
+        it.id === itemId
+          ? { ...it, done, doneAt: done ? new Date().toISOString() : null }
+          : it
+      ),
+    }));
+  }, []);
+
+  // ── 伝達メモ: ある人物の未伝達項目を全て伝達済みに ──
+  const markAllMemoDone = useCallback((personId) => {
+    const now = new Date().toISOString();
+    setMemo(prev => ({
+      ...prev,
+      items: prev.items.map(it =>
+        it.personId === personId && !it.done
+          ? { ...it, done: true, doneAt: now }
+          : it
+      ),
+    }));
+  }, []);
+
+  // ── 伝達メモ: 項目を他の人物へコピー（複数人物可）──
+  const copyMemoItemsToPersons = useCallback((itemIds, targetPersonIds) => {
+    setMemo(prev => {
+      const sources = prev.items.filter(it => itemIds.includes(it.id));
+      const newItems = [];
+      for (const pid of targetPersonIds) {
+        for (const src of sources) {
+          newItems.push({
+            id: crypto.randomUUID(),
+            personId: pid,
+            name: src.name,
+            memo: src.memo,
+            done: false,
+            doneAt: null,
+            createdAt: new Date().toISOString(),
+          });
+        }
+      }
+      return { ...prev, items: [...prev.items, ...newItems] };
+    });
   }, []);
 
   return (
@@ -486,6 +630,8 @@ function AppProvider({ children }) {
       settings, saveSettings, restoreData,
       auth, login, logout, syncStatus, isLoggedIn,
       selectedHistoryDate, setSelectedHistoryDate,
+      memo, addMemoPerson, deleteMemoPerson, reorderMemoPerson, addMemoItem, updateMemoItem,
+      deleteMemoItem, toggleMemoDone, markAllMemoDone, copyMemoItemsToPersons,
     }}>
       {children}
     </AppContext.Provider>
@@ -560,7 +706,7 @@ function LoginScreen({ onDone }) {
           style={{ borderRadius: 24, background: "linear-gradient(145deg, #3B362F 0%, #6E6456 60%, #9A8459 100%)", boxShadow: "0 14px 36px rgba(59,54,47,0.3)" }}>
           <AppLogoSvg size={52} />
         </div>
-        <p className="font-black text-3xl" style={{ color: "#3B362F", fontFamily: FONT_DISPLAY, letterSpacing: "0.05em" }}>けあキロ</p>
+        <p className="font-black text-3xl" style={{ color: "#3B362F", fontFamily: FONT_DISPLAY, letterSpacing: "0.05em" }}>キロクくん</p>
         <p className="text-xs mt-1.5" style={{ color: "#9C9488", letterSpacing: "0.15em" }}>-Care no Kiroku-</p>
       </div>
 
@@ -903,7 +1049,8 @@ function EditRecordModal({ record, onClose }) {
 
 // ─── RecordCard ───────────────────────────────────────────────────────────────
 function RecordCard({ record, index }) {
-  const { updateRecord, deleteRecord, reorderRecord, togglePin, todayRecords } = useApp();
+  const { updateRecord, deleteRecord, reorderRecord, togglePin, todayRecords, addMemoItem } = useApp();
+  const [showRelayPicker, setShowRelayPicker] = useState(false);
   const [expanded, setExpanded] = useState(true);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -1036,9 +1183,30 @@ function RecordCard({ record, index }) {
             );
           })}
         </div>
+        {/* 2段目: 伝達メモに追加 */}
+        <div className="px-3 pb-2.5"
+          style={{ background: confirmed ? "rgba(160,140,104,0.06)" : "#F7F3EA" }}>
+          <button onClick={() => setShowRelayPicker(true)}
+            className="w-full flex items-center justify-center gap-1.5 py-2 rounded-full text-[11px] font-bold transition-all active:scale-95"
+            style={{ background: "#fff", color: "#A08C68", border: "1px solid #E0D7C5" }}>
+            <MessageSquare size={13} />
+            伝達メモに追加
+          </button>
+        </div>
       </div>
 
       {editing && <EditRecordModal record={record} onClose={() => setEditing(false)} />}
+      {showRelayPicker && (
+        <PersonPickerModal
+          title="伝達メモに追加"
+          multi={true}
+          onConfirm={(personIds) => {
+            personIds.forEach(pid => addMemoItem(pid, record.name, record.memo));
+            setShowRelayPicker(false);
+          }}
+          onClose={() => setShowRelayPicker(false)}
+        />
+      )}
     </>
   );
 }
@@ -1424,6 +1592,612 @@ function Settings() {
   );
 }
 
+// ─── PersonPickerModal（伝達メモの人物を選ぶ／追加する）──────────────────────
+function PersonPickerModal({ title = "伝達メモに追加", multi = false, onConfirm, onClose }) {
+  const { memo, addMemoPerson } = useApp();
+  const [selected, setSelected] = useState([]);      // personId[]
+  const [newName, setNewName] = useState("");
+  const [adding, setAdding] = useState(false);
+
+  const toggle = (id) => {
+    if (multi) {
+      setSelected(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+    } else {
+      setSelected([id]);
+    }
+  };
+
+  const handleAddPerson = () => {
+    const name = newName.trim();
+    if (!name) return;
+    const id = addMemoPerson(name);
+    setNewName("");
+    setAdding(false);
+    if (id) {
+      if (multi) setSelected(prev => [...prev, id]);
+      else setSelected([id]);
+    }
+  };
+
+  const canConfirm = selected.length > 0;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4"
+      style={{ background: "rgba(42,38,32,0.45)", backdropFilter: "blur(5px)" }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="ck-modal-in bg-white w-full max-w-md shadow-2xl" style={{ borderRadius: 24 }}>
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: "1px solid #EFEBE3" }}>
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-full flex items-center justify-center" style={{ background: "#F3EFE7" }}>
+              <Send size={14} style={{ color: "#A08C68" }} />
+            </div>
+            <h2 className="font-bold" style={{ color: "#2C2823", fontFamily: FONT_DISPLAY }}>{title}</h2>
+          </div>
+          <button onClick={onClose} className="p-2 rounded-xl transition-colors hover:bg-stone-100" style={{ color: "#9C9488" }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="px-5 py-4">
+          <p className="text-xs font-bold mb-2.5" style={{ color: "#9C9488", letterSpacing: "0.06em" }}>
+            {multi ? "コピー先の人物を選択（複数可）" : "どの人物の伝達メモに追加しますか？"}
+          </p>
+
+          {/* 人物リスト */}
+          {memo.persons.length === 0 ? (
+            <p className="text-xs py-3 text-center" style={{ color: "#C5BDAE" }}>
+              まだ人物が登録されていません。下から追加してください。
+            </p>
+          ) : (
+            <div className="space-y-2 max-h-56 overflow-y-auto">
+              {memo.persons.map(p => {
+                const on = selected.includes(p.id);
+                return (
+                  <button key={p.id} onClick={() => toggle(p.id)}
+                    className="w-full flex items-center gap-2.5 text-left px-3.5 py-3 transition-all"
+                    style={{
+                      borderRadius: 14,
+                      border: on ? "1.5px solid #B49A6C" : "1.5px solid #E7E2D9",
+                      background: on ? "#FAF6EE" : "#F8F6F1",
+                    }}>
+                    <span className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0"
+                      style={{ background: on ? "#3B362F" : "#EDE9E1", border: on ? "none" : "1.5px solid #D9D3C7" }}>
+                      {on && <Check size={12} className="text-white" />}
+                    </span>
+                    <span className="font-bold text-sm" style={{ color: "#3C372F", fontFamily: FONT_DISPLAY }}>{p.name}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* 新規人物追加 */}
+          {adding ? (
+            <div className="flex gap-2 mt-3">
+              <input type="text" value={newName} autoFocus
+                onChange={e => setNewName(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && handleAddPerson()}
+                placeholder="新しい人物の名前"
+                className="ck-input flex-1 px-3.5 py-2.5 text-sm" />
+              <button onClick={handleAddPerson} disabled={!newName.trim()}
+                className={`px-4 rounded-xl font-bold text-sm ${newName.trim() ? "ck-btn-primary" : "ck-btn-disabled"}`}>
+                追加
+              </button>
+            </div>
+          ) : (
+            <button onClick={() => setAdding(true)}
+              className="w-full flex items-center justify-center gap-1.5 mt-3 py-2.5 rounded-xl font-bold text-sm transition-all active:scale-95"
+              style={{ background: "#F3EFE7", color: "#A08C68", border: "1px dashed #D9C193" }}>
+              <UserPlus size={15} />
+              新しい人物を追加
+            </button>
+          )}
+        </div>
+
+        {/* Actions */}
+        <div className="px-5 pb-5 flex gap-2.5">
+          <button onClick={onClose}
+            className="flex-1 py-3.5 rounded-xl font-bold text-sm transition-all active:scale-95"
+            style={{ background: "#EFEBE3", color: "#5B554B" }}>
+            キャンセル
+          </button>
+          <button onClick={() => canConfirm && onConfirm(selected)} disabled={!canConfirm}
+            className={`flex-1 flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm ${canConfirm ? "ck-btn-primary" : "ck-btn-disabled"}`}>
+            <Check size={16} />
+            決定
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── RelayMemoCard（伝達メモの1件のカード）──────────────────────────────────
+function RelayMemoCard({ item, expiring }) {
+  const { updateMemoItem, deleteMemoItem, toggleMemoDone } = useApp();
+  const [expanded, setExpanded] = useState(true);
+  const [editing, setEditing] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [editName, setEditName] = useState(item.name);
+  const [editMemo, setEditMemo] = useState(item.memo);
+
+  const handleDelete = () => {
+    if (confirmDelete) deleteMemoItem(item.id);
+    else { setConfirmDelete(true); setTimeout(() => setConfirmDelete(false), 3000); }
+  };
+
+  const handleSaveEdit = () => {
+    updateMemoItem(item.id, { name: editName.trim(), memo: editMemo.trim() });
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <div className="overflow-hidden" style={{ borderRadius: 18, background: "#fff", border: "1.5px solid #B49A6C", boxShadow: "0 1px 2px rgba(59,54,47,0.05)" }}>
+        <div className="p-4 space-y-3">
+          <input type="text" value={editName} onChange={e => setEditName(e.target.value)}
+            placeholder="氏名 / タイトル" className="ck-input w-full px-3.5 py-2.5 text-base" />
+          <textarea value={editMemo} onChange={e => setEditMemo(e.target.value)} rows={3}
+            placeholder="伝達内容" className="ck-input w-full px-3.5 py-2.5 text-base resize-none leading-relaxed" />
+          <div className="flex gap-2">
+            <button onClick={() => setEditing(false)}
+              className="flex-1 py-2.5 rounded-xl font-bold text-sm active:scale-95" style={{ background: "#EFEBE3", color: "#5B554B" }}>
+              キャンセル
+            </button>
+            <button onClick={handleSaveEdit} className="ck-btn-primary flex-1 py-2.5 rounded-xl font-bold text-sm">
+              保存する
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="overflow-hidden transition-all duration-200"
+      style={{
+        borderRadius: 18,
+        background: item.done ? "linear-gradient(180deg, #F4F1EA 0%, #EFEBE2 100%)" : "#ffffff",
+        border: expiring && !item.done ? "1.5px solid #E0A0A0" : item.done ? "1px solid #E0D7C5" : "1px solid #E7E2D9",
+        boxShadow: item.done ? "0 1px 2px rgba(59,54,47,0.04)" : "0 1px 2px rgba(59,54,47,0.05), 0 10px 26px -16px rgba(59,54,47,0.16)",
+        opacity: item.done ? 0.85 : 1,
+      }}>
+      <div className="flex items-center gap-3 px-4 py-3">
+        <div className="flex-1 min-w-0">
+          <p className="font-bold text-base truncate" style={{ color: item.done ? "#8B8478" : "#2C2823", fontFamily: FONT_DISPLAY }}>
+            {item.name || "　"}
+          </p>
+        </div>
+        <div className="flex items-center gap-0.5">
+          <button onClick={() => setExpanded(v => !v)} className="p-1.5 rounded-lg hover:bg-stone-100" style={{ color: "#B0A899" }}>
+            {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          </button>
+          <button onClick={() => { setEditName(item.name); setEditMemo(item.memo); setEditing(true); }}
+            className="p-1.5 rounded-lg" style={{ color: "#B0A899" }} title="編集">
+            <Pencil size={15} />
+          </button>
+          <button onClick={handleDelete}
+            className="p-1.5 rounded-lg transition-colors"
+            style={confirmDelete ? { background: "#FEE2E2", color: "#DC2626" } : { color: "#CFC8BA" }}
+            title={confirmDelete ? "もう一度で削除" : "削除"}>
+            <Trash2 size={15} />
+          </button>
+        </div>
+      </div>
+
+      {expanded && item.memo && (
+        <div className="px-4 pb-3">
+          <p className="text-sm leading-relaxed whitespace-pre-wrap" style={{ color: item.done ? "#8B8478" : "#5B554B" }}>
+            {item.memo}
+          </p>
+        </div>
+      )}
+
+      {/* 追加日 */}
+      <div className="px-4 pb-1 flex items-center gap-1.5">
+        <Calendar size={11} style={{ color: "#C5BDAE" }} />
+        <span className="text-[11px]" style={{ color: "#C5BDAE" }}>
+          {new Date(item.createdAt).toLocaleDateString("ja-JP", { month: "long", day: "numeric" })} 追加
+        </span>
+      </div>
+
+      {/* 伝達済みの日時表示 */}
+      {item.done && item.doneAt && (
+        <div className="px-4 pb-2 flex items-center gap-1.5">
+          <Clock size={11} style={{ color: "#A08C68" }} />
+          <span className="text-[11px]" style={{ color: "#9C9488" }}>
+            {new Date(item.doneAt).toLocaleString("ja-JP", { month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" })} に伝達済み
+          </span>
+        </div>
+      )}
+
+      {/* 期限警告 */}
+      {expiring && !item.done && (
+        <div className="px-4 pb-2 flex items-center gap-1.5">
+          <AlertCircle size={11} style={{ color: "#C0392B" }} />
+          <span className="text-[11px] font-bold" style={{ color: "#C0392B" }}>まもなく自動削除されます（未伝達）</span>
+        </div>
+      )}
+
+      {/* 伝達済み / 戻すボタン */}
+      <div className="px-3 py-2.5" style={{ borderTop: item.done ? "1px solid #E0D7C5" : "1px solid #EFEBE3", background: item.done ? "rgba(180,154,108,0.06)" : "#FBF8F1" }}>
+        {item.done ? (
+          <button onClick={() => toggleMemoDone(item.id, false)}
+            className="w-full flex items-center justify-center gap-1.5 py-2 rounded-full text-sm font-bold transition-all active:scale-95"
+            style={{ background: "#fff", color: "#8B8478", border: "1px solid #DED8CC" }}>
+            <ChevronUp size={14} />
+            未伝達に戻す
+          </button>
+        ) : (
+          <button onClick={() => toggleMemoDone(item.id, true)}
+            className="ck-btn-primary w-full flex items-center justify-center gap-1.5 py-2 rounded-full text-sm font-bold">
+            <Check size={15} />
+            伝達済みにする
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── RelayMemoView（伝達メモタブ本体）────────────────────────────────────────
+function RelayMemoView() {
+  const {
+    memo, addMemoPerson, deleteMemoPerson, reorderMemoPerson, addMemoItem,
+    markAllMemoDone, copyMemoItemsToPersons,
+  } = useApp();
+
+  const [activePersonId, setActivePersonId] = useState(memo.persons[0]?.id ?? null);
+  const [showDone, setShowDone] = useState(false);
+  const [addingPerson, setAddingPerson] = useState(false);
+  const [newPersonName, setNewPersonName] = useState("");
+  const [newName, setNewName] = useState("");
+  const [newMemo, setNewMemo] = useState("");
+  const [copyMode, setCopyMode] = useState(false);
+  const [copySelected, setCopySelected] = useState([]);
+  const [showCopyPicker, setShowCopyPicker] = useState(false);
+  const [confirmDeletePerson, setConfirmDeletePerson] = useState(false);
+  const [showReorderModal, setShowReorderModal] = useState(false);
+
+  // activePersonが消えたら先頭に
+  useEffect(() => {
+    if (!memo.persons.find(p => p.id === activePersonId)) {
+      setActivePersonId(memo.persons[0]?.id ?? null);
+    }
+  }, [memo.persons, activePersonId]);
+
+  const handleAddPerson = () => {
+    const name = newPersonName.trim();
+    if (!name) return;
+    const id = addMemoPerson(name);
+    setNewPersonName("");
+    setAddingPerson(false);
+    if (id) setActivePersonId(id);
+  };
+
+  const handleAddItem = () => {
+    if (!activePersonId) return;
+    if (!newName.trim() && !newMemo.trim()) return;
+    addMemoItem(activePersonId, newName, newMemo);
+    setNewName(""); setNewMemo("");
+  };
+
+  // 期限が近い項目か判定
+  const isExpiring = (item) => {
+    const warn = new Date();
+    warn.setDate(warn.getDate() - (RETENTION_DAYS - 3));
+    return new Date(item.createdAt).getTime() < warn.getTime();
+  };
+
+  const personItems = memo.items.filter(it => it.personId === activePersonId);
+  // 追加順（古い順）でソート
+  const activeItems = personItems.filter(it => !it.done)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  const doneItems = personItems.filter(it => it.done)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  const undoneCount = activeItems.length;
+
+  // 人物がまだいない場合
+  if (memo.persons.length === 0) {
+    return (
+      <div className="space-y-4">
+        <div className="ck-card text-center py-10">
+          <div className="w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-3"
+            style={{ background: "linear-gradient(135deg, #F3EFE7, #F5F3EE)" }}>
+            <Send size={24} style={{ color: "#D9C193" }} />
+          </div>
+          <p className="text-sm font-medium" style={{ color: "#9C9488" }}>まだ人物が登録されていません</p>
+          <p className="text-xs mt-1 mb-4" style={{ color: "#C5BDAE" }}>伝達メモを使う人物を追加しましょう</p>
+          {addingPerson ? (
+            <div className="flex gap-2 px-5 max-w-sm mx-auto">
+              <input type="text" value={newPersonName} autoFocus
+                onChange={e => setNewPersonName(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && handleAddPerson()}
+                placeholder="人物の名前" className="ck-input flex-1 px-3.5 py-2.5 text-sm" />
+              <button onClick={handleAddPerson} disabled={!newPersonName.trim()}
+                className={`px-4 rounded-xl font-bold text-sm whitespace-nowrap ${newPersonName.trim() ? "ck-btn-primary" : "ck-btn-disabled"}`}>
+                追加
+              </button>
+            </div>
+          ) : (
+            <button onClick={() => setAddingPerson(true)}
+              className="ck-btn-primary inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl font-bold text-sm">
+              <UserPlus size={15} /> 人物を追加
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // 全体で期限が近い未伝達項目があるか
+  const expiringCount = memo.items.filter(it => !it.done && isExpiring(it)).length;
+
+  return (
+    <div className="space-y-4">
+      {/* 期限警告バナー */}
+      {expiringCount > 0 && (
+        <div className="flex items-start gap-2.5 px-4 py-3 rounded-2xl"
+          style={{ background: "#FDF2F2", border: "1px solid #F0C0C0" }}>
+          <AlertCircle size={16} className="flex-shrink-0 mt-0.5" style={{ color: "#C0392B" }} />
+          <div>
+            <p className="text-sm font-bold" style={{ color: "#C0392B" }}>まもなく削除される未伝達事項があります</p>
+            <p className="text-xs mt-0.5" style={{ color: "#D08080" }}>
+              {expiringCount}件が作成から30日に近づいています。伝達済みにするか、内容をご確認ください。
+            </p>
+          </div>
+        </div>
+      )}
+      {/* 人物タブ（横スクロール） */}
+      <div className="flex items-center gap-2 overflow-x-auto pb-1" style={{ WebkitOverflowScrolling: "touch" }}>
+        {memo.persons.map((p) => {
+          const on = p.id === activePersonId;
+          const cnt = memo.items.filter(it => it.personId === p.id && !it.done).length;
+          return (
+            <button key={p.id} onClick={() => { setActivePersonId(p.id); setShowDone(false); setCopyMode(false); }}
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-full font-bold text-sm whitespace-nowrap transition-all active:scale-95 flex-shrink-0"
+              style={on
+                ? { background: "linear-gradient(135deg, #3B362F, #6E6456)", color: "#fff", boxShadow: "0 4px 10px -4px rgba(59,54,47,0.5)" }
+                : { background: "#fff", color: "#877F72", border: "1px solid #E7E2D9" }}>
+              {p.name}
+              {cnt > 0 && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold"
+                  style={on ? { background: "rgba(255,255,255,0.25)", color: "#fff" } : { background: "#F3EFE7", color: "#A08C68" }}>
+                  {cnt}
+                </span>
+              )}
+            </button>
+          );
+        })}
+        {/* 人物追加ボタン */}
+        <button onClick={() => setAddingPerson(true)}
+          className="flex items-center justify-center w-9 h-9 rounded-full flex-shrink-0 transition-all active:scale-95"
+          style={{ background: "#F3EFE7", color: "#A08C68", border: "1px dashed #D9C193" }}
+          title="人物を追加">
+          <UserPlus size={16} />
+        </button>
+        {/* 並べ替えボタン */}
+        {memo.persons.length > 1 && (
+          <button onClick={() => setShowReorderModal(true)}
+            className="flex items-center justify-center w-9 h-9 rounded-full flex-shrink-0 transition-all active:scale-95"
+            style={{ background: "#F3EFE7", color: "#A08C68", border: "1px solid #E0D7C5" }}
+            title="並べ替え">
+            <ArrowUp size={16} />
+          </button>
+        )}
+      </div>
+
+      {/* 人物追加インライン入力 */}
+      {addingPerson && (
+        <div className="flex gap-2">
+          <input type="text" value={newPersonName} autoFocus
+            onChange={e => setNewPersonName(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && handleAddPerson()}
+            placeholder="新しい人物の名前" className="ck-input flex-1 px-3.5 py-2.5 text-sm" />
+          <button onClick={handleAddPerson} disabled={!newPersonName.trim()}
+            className={`px-4 rounded-xl font-bold text-sm whitespace-nowrap ${newPersonName.trim() ? "ck-btn-primary" : "ck-btn-disabled"}`}>
+            追加
+          </button>
+          <button onClick={() => { setAddingPerson(false); setNewPersonName(""); }}
+            className="px-3 rounded-xl font-bold text-sm" style={{ background: "#EFEBE3", color: "#877F72" }}>
+            ×
+          </button>
+        </div>
+      )}
+
+      {activePersonId && (
+        <>
+          {/* 新規伝達事項の入力 */}
+          <div className="ck-card p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <div className="w-7 h-7 flex items-center justify-center flex-shrink-0"
+                style={{ borderRadius: 10, background: "linear-gradient(135deg, #3B362F, #6E6456)" }}>
+                <Send size={13} className="text-white" />
+              </div>
+              <h2 className="text-xs font-bold" style={{ color: "#5B554B", letterSpacing: "0.08em", fontFamily: FONT_DISPLAY }}>
+                {memo.persons.find(p => p.id === activePersonId)?.name} への伝達事項
+              </h2>
+            </div>
+            <div className="space-y-2.5">
+              <input type="text" value={newName} onChange={e => setNewName(e.target.value)}
+                placeholder="氏名 / タイトル" className="ck-input w-full px-3.5 py-2.5 text-base" />
+              <textarea value={newMemo} onChange={e => setNewMemo(e.target.value)} rows={2}
+                placeholder="伝達したい内容" className="ck-input w-full px-3.5 py-2.5 text-base resize-none leading-relaxed" />
+              <button onClick={handleAddItem} disabled={!newName.trim() && !newMemo.trim()}
+                className={`w-full flex items-center justify-center gap-1.5 py-3 rounded-xl font-bold text-sm ${(newName.trim() || newMemo.trim()) ? "ck-btn-primary" : "ck-btn-disabled"}`}>
+                <ChevronRight size={16} /> 伝達事項を追加
+              </button>
+            </div>
+          </div>
+
+          {/* コピー操作バー */}
+          {activeItems.length > 0 && (
+            <div className="flex items-center gap-2">
+              {!copyMode ? (
+                <button onClick={() => { setCopyMode(true); setCopySelected([]); }}
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold transition-all active:scale-95"
+                  style={{ background: "#F3EFE7", color: "#A08C68", border: "1px solid #E0D7C5" }}>
+                  <Copy size={13} /> 他の人にコピー
+                </button>
+              ) : (
+                <>
+                  <span className="text-xs font-bold" style={{ color: "#877F72" }}>{copySelected.length}件選択中</span>
+                  <button onClick={() => copySelected.length > 0 && setShowCopyPicker(true)}
+                    disabled={copySelected.length === 0}
+                    className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold ${copySelected.length > 0 ? "ck-btn-primary" : "ck-btn-disabled"}`}>
+                    <Send size={13} /> コピー先を選ぶ
+                  </button>
+                  <button onClick={() => { setCopyMode(false); setCopySelected([]); }}
+                    className="px-3 py-2 rounded-xl text-xs font-bold" style={{ background: "#EFEBE3", color: "#877F72" }}>
+                    やめる
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* 未伝達の項目リスト */}
+          {activeItems.length === 0 ? (
+            <div className="text-center py-8">
+              <CheckCircle2 size={28} className="mx-auto mb-2" style={{ color: "#BFD9CE" }} />
+              <p className="text-sm font-medium" style={{ color: "#9C9488" }}>未伝達の事項はありません</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {activeItems.map(item => (
+                <div key={item.id} className="relative">
+                  {copyMode && (
+                    <button onClick={() => setCopySelected(prev => prev.includes(item.id) ? prev.filter(x => x !== item.id) : [...prev, item.id])}
+                      className="absolute top-3 left-2 z-10 w-5 h-5 rounded-md flex items-center justify-center"
+                      style={{ background: copySelected.includes(item.id) ? "#3B362F" : "#fff", border: "1.5px solid #B49A6C" }}>
+                      {copySelected.includes(item.id) && <Check size={12} className="text-white" />}
+                    </button>
+                  )}
+                  <div style={copyMode ? { paddingLeft: "1.75rem" } : {}}>
+                    <RelayMemoCard item={item} expiring={isExpiring(item)} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 全て伝達済みボタン */}
+          {undoneCount > 0 && (
+            <button onClick={() => markAllMemoDone(activePersonId)}
+              className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm transition-all active:scale-95"
+              style={{ background: "linear-gradient(135deg, #6F7B59, #7A8765)", color: "#fff", boxShadow: "0 8px 18px -8px rgba(111,123,89,0.5)" }}>
+              <CheckCircle2 size={16} /> この人の全てを伝達済みにする（{undoneCount}件）
+            </button>
+          )}
+
+          {/* 伝達済みの表示トグル */}
+          {doneItems.length > 0 && (
+            <div className="pt-1">
+              <button onClick={() => setShowDone(v => !v)}
+                className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all"
+                style={{ background: "#F8F6F1", color: "#877F72", border: "1px solid #E7E2D9" }}>
+                {showDone ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                伝達済みを{showDone ? "隠す" : "表示"}（{doneItems.length}件）
+              </button>
+              {showDone && (
+                <div className="space-y-3 mt-3">
+                  {doneItems.map(item => <RelayMemoCard key={item.id} item={item} expiring={false} />)}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 人物の削除 */}
+          <div className="pt-2">
+            <button onClick={() => {
+                if (confirmDeletePerson) { deleteMemoPerson(activePersonId); setConfirmDeletePerson(false); }
+                else { setConfirmDeletePerson(true); setTimeout(() => setConfirmDeletePerson(false), 3000); }
+              }}
+              className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all"
+              style={confirmDeletePerson
+                ? { background: "#FEE2E2", color: "#DC2626", border: "1px solid #FECACA" }
+                : { background: "transparent", color: "#C5BDAE" }}>
+              <Trash2 size={13} />
+              {confirmDeletePerson ? "もう一度押すとこの人物と全項目を削除" : "この人物を削除"}
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* 人物並べ替えモーダル */}
+      {showReorderModal && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4"
+          style={{ background: "rgba(42,38,32,0.45)", backdropFilter: "blur(5px)" }}
+          onClick={e => e.target === e.currentTarget && setShowReorderModal(false)}>
+          <div className="ck-modal-in bg-white w-full max-w-md shadow-2xl" style={{ borderRadius: 24 }}>
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: "1px solid #EFEBE3" }}>
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full flex items-center justify-center" style={{ background: "#F3EFE7" }}>
+                  <ArrowUp size={14} style={{ color: "#A08C68" }} />
+                </div>
+                <h2 className="font-bold" style={{ color: "#2C2823", fontFamily: FONT_DISPLAY }}>人物の並べ替え</h2>
+              </div>
+              <button onClick={() => setShowReorderModal(false)}
+                className="p-2 rounded-xl hover:bg-stone-100" style={{ color: "#9C9488" }}>
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* リスト */}
+            <div className="px-5 py-4 space-y-2 max-h-80 overflow-y-auto">
+              {memo.persons.map((p, i) => (
+                <div key={p.id} className="flex items-center gap-3 px-3.5 py-3 rounded-xl"
+                  style={{ background: "#F8F6F1", border: "1px solid #E7E2D9" }}>
+                  <span className="font-bold flex-1 text-sm" style={{ color: "#3C372F", fontFamily: FONT_DISPLAY }}>
+                    {p.name}
+                  </span>
+                  <div className="flex gap-1">
+                    <button onClick={() => reorderMemoPerson(p.id, "up")} disabled={i === 0}
+                      className="w-8 h-8 rounded-lg flex items-center justify-center transition-all active:scale-95 disabled:opacity-20"
+                      style={{ background: "#EFEBE3", color: "#877F72" }}>
+                      <ArrowUp size={15} />
+                    </button>
+                    <button onClick={() => reorderMemoPerson(p.id, "down")} disabled={i === memo.persons.length - 1}
+                      className="w-8 h-8 rounded-lg flex items-center justify-center transition-all active:scale-95 disabled:opacity-20"
+                      style={{ background: "#EFEBE3", color: "#877F72" }}>
+                      <ArrowDown size={15} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* 閉じるボタン */}
+            <div className="px-5 pb-5">
+              <button onClick={() => setShowReorderModal(false)}
+                className="ck-btn-primary w-full py-3.5 rounded-xl font-bold text-sm">
+                完了
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* コピー先選択モーダル */}
+      {showCopyPicker && (
+        <PersonPickerModal
+          title="コピー先を選択"
+          multi={true}
+          onConfirm={(targetIds) => {
+            copyMemoItemsToPersons(copySelected, targetIds);
+            setShowCopyPicker(false);
+            setCopyMode(false);
+            setCopySelected([]);
+          }}
+          onClose={() => setShowCopyPicker(false)}
+        />
+      )}
+    </div>
+  );
+}
+
 // ─── HistoryView ──────────────────────────────────────────────────────────────
 function CopyPastButton({ records }) {
   const [copied, setCopied] = useState(false);
@@ -1551,6 +2325,7 @@ function AppShell() {
 
   const navItems = [
     { id: "main", icon: ClipboardList, label: "記録" },
+    { id: "relay", icon: MessageSquare, label: "伝達メモ" },
     { id: "history", icon: History, label: "履歴" },
     { id: "settings", icon: SettingsIcon, label: "設定" },
   ];
@@ -1563,14 +2338,7 @@ function AppShell() {
         <div className="max-w-lg mx-auto px-4 flex items-center justify-between"
           style={{ paddingTop: "calc(env(safe-area-inset-top) + 0.75rem)", paddingBottom: "0.75rem" }}>
           <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 flex items-center justify-center flex-shrink-0"
-              style={{ borderRadius: 12, background: "linear-gradient(145deg, #3B362F 0%, #6E6456 100%)", boxShadow: "0 6px 14px -6px rgba(59,54,47,0.5)" }}>
-              <AppLogoSvg size={26} />
-            </div>
-            <div>
-              <h1 className="font-black text-lg leading-none" style={{ color: "#3B362F", fontFamily: FONT_DISPLAY, letterSpacing: "0.04em" }}>けあキロ</h1>
-              <p className="text-[11px] mt-0.5" style={{ color: "#9C9488" }}>{today}</p>
-            </div>
+            <p className="font-bold text-base" style={{ color: "#3C372F", fontFamily: FONT_DISPLAY }}>{today}</p>
           </div>
           <div className="flex items-center gap-2">
             <SyncBadge />
@@ -1630,6 +2398,16 @@ function AppShell() {
           </>
         )}
 
+        {view === "relay" && (
+          <>
+            <div className="flex items-center gap-2 px-1">
+              <MessageSquare size={16} style={{ color: "#A08C68" }} />
+              <h2 className="font-bold" style={{ color: "#3C372F", fontFamily: FONT_DISPLAY }}>伝達メモ</h2>
+            </div>
+            <RelayMemoView />
+          </>
+        )}
+
         {view === "history" && (
           <>
             <div className="flex items-center gap-2 px-1">
@@ -1668,8 +2446,8 @@ function AppShell() {
                   }}>
                   <Icon size={21} />
                 </span>
-                <span className="text-[10px] font-bold"
-                  style={{ color: active ? "#3B362F" : "#B0A899" }}>{label}</span>
+                <span className="font-bold whitespace-nowrap"
+                  style={{ fontSize: 9.5, color: active ? "#3B362F" : "#B0A899" }}>{label}</span>
               </button>
             );
           })}
@@ -1772,7 +2550,7 @@ function SplashScreen({ onDone }) {
           WebkitBackgroundClip: "text", backgroundClip: "text",
           WebkitTextFillColor: "transparent", color: "#3B362F",
         }}>
-          けあキロ
+          キロクくん
         </p>
         <p style={{ fontSize: 13, color: "#6E6456", fontWeight: 700, letterSpacing: "0.18em", marginTop: 10 }}>
           -Care no Kiroku-
@@ -1782,7 +2560,7 @@ function SplashScreen({ onDone }) {
       {/* Tagline */}
       <p style={{
         position: "relative",
-        marginTop: 34, fontSize: 12.5, color: "#A39B8C", fontWeight: 500, letterSpacing: "0.12em",
+        marginTop: 34, fontSize: 12.5, color: "#6E6456", fontWeight: 600, letterSpacing: "0.12em",
         opacity: phase === "in" ? 0 : 1,
         transition: "opacity 0.55s ease 0.35s",
       }}>
